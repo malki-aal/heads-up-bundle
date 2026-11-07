@@ -41,7 +41,7 @@ from strategy import preflop_equity, rules_equity, select_action
 warmup()
 
 # Set PARTICIPANT to the team name registered with the organizers.
-PARTICIPANT = "Your Team Name"
+PARTICIPANT = "datajohn"
 BOT_MODE = os.environ.get("HEADS_UP_MODE", "ml").lower()
 if BOT_MODE not in ("ml", "rules"):
     raise ValueError("HEADS_UP_MODE must be ml or rules")
