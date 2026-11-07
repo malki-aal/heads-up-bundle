@@ -57,6 +57,17 @@ def new_half(config: AgentConfig, memory: dict) -> None:
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
+    # Guide 4.5: never let a bug become a judge error (5 errors = forfeit).
+    # CHECK_CALL is always legal, so it is the safe fallback.
+    try:
+        action = _choose_action(obs, memory)
+    except Exception:
+        memory["fallbacks"] = memory.get("fallbacks", 0) + 1
+        return Action.CHECK_CALL
+    return action if action in obs.legal_actions else Action.CHECK_CALL
+
+
+def _choose_action(obs: Observation, memory: dict) -> Action:
     # The estimate is constant across repeat decisions on the same board.
     key = (obs.hand_index, tuple(obs.hole_cards), tuple(obs.board))
     if memory.get("equity_key") != key:
