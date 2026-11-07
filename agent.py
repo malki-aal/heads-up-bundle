@@ -29,8 +29,10 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from evaluator import card_rank, card_suit, cards_to_str, omaha_score, warmup  # handy helpers, see evaluator.py
-from game import Action, AgentConfig, HandResult, Observation, Street
+from equity import EquityModel
+from evaluator import warmup
+from game import Action, AgentConfig, HandResult, Observation
+from strategy import preflop_equity, rules_equity, select_action
 
 # Build omaha_score's lookup table now, while the server starts, instead of
 # during your first decision (where it would eat into your time bank).
@@ -38,73 +40,41 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 # answer within 15 seconds of starting.
 warmup()
 
-# rename as your team/bot's name
-PARTICIPANT = "TotallyAwesomeDatathonParticipant"
-AGENT_NAME = "JustAsAwesomeAgent"
-
+# Set PARTICIPANT to the team name registered with the organizers.
+PARTICIPANT = "Your Team Name"
+BOT_MODE = os.environ.get("HEADS_UP_MODE", "ml").lower()
+if BOT_MODE not in ("ml", "rules"):
+    raise ValueError("HEADS_UP_MODE must be ml or rules")
+AGENT_NAME = "EquityNet" if BOT_MODE == "ml" else "EquityRules"
 
 # ===== YOUR CODE HERE =====
 
+MODEL = EquityModel() if BOT_MODE == "ml" else None
+
+
 def new_half(config: AgentConfig, memory: dict) -> None:
-    """Called at the start of each half-match (1000 hands).
-
-    `memory` is a fresh, empty dict every half. Store anything you want to
-    remember between hands in it, e.g. memory["opp_raises"] = 0.
-    `config` holds the match settings (starting_stack, big_blind, ...).
-
-    In the tournament, each half runs in a brand-new copy of your server,
-    so nothing you learn in one half carries over to the other half.
-    """
-    memory["hands_played"] = 0
+    memory.clear()
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
-    """Called every time it is your turn. Return one of obs.legal_actions.
+    # The estimate is constant across repeat decisions on the same board.
+    key = (obs.hand_index, tuple(obs.hole_cards), tuple(obs.board))
+    if memory.get("equity_key") != key:
+        _, hole, board = key
+        if not board:
+            estimate = preflop_equity(hole)
+        elif MODEL is None:
+            estimate = rules_equity(hole, board)
+        else:
+            estimate = MODEL.estimate(hole, board)
+        memory.update(equity_key=key, equity=estimate)
 
-    What you can see in obs:
-        hand_index          which hand of the half this is (0, 1, 2, ...)
-        street              Street.PREFLOP, Street.FLOP, Street.TURN or Street.RIVER
-        hole_cards          your 5 cards as ints, sorted ascending (0-35)
-        board               board (community) cards seen so far (0, 3, 4 or 5 ints)
-        pot                 total chips both players put in this hand
-        to_call             chips you must add to match the opponent
-        my_bet, opp_bet     chips you,opponent put in on THIS street
-        my_stack, opp_stack chips each player still has behind
-        is_button           True if you are the button (small blind)
-        legal_actions       the Actions you may return right now
-        raise_to            {RAISE_HALF: total, RAISE_POT: total} for legal raises
-        min_raise_to        smallest normal raise total (all-ins may be lower)
-        raises_this_street  raises so far this street (max 4)
-        action_history      this hand's actions so far; each has
-                            street, is_me, action, amount, street_total
-        big_blind           size of the big blind in chips
-
-    Actions: Action.FOLD, Action.CHECK_CALL, Action.RAISE_HALF, Action.RAISE_POT
-    Cards are ints: card_rank(c) is 0 (six) .. 8 (ace), card_suit(c) is 0..3,
-    and cards_to_str(obs.hole_cards) prints them like "6h 7c 9s Kd Ah".
-    Once all 5 board cards are out, omaha_score(obs.hole_cards, obs.board)
-    scores your hand (higher is better).
-    """
-
-    # Simple example of a heuristic bot, which just checks when it is of no cost, otherwise folds
-    # Replace this with your strategy!
-    if obs.to_call == 0:
-        return Action.CHECK_CALL
-    return Action.FOLD
+    return select_action(obs, memory["equity"])
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    """Called once for every finished hand. Optional: learn from what happened.
+    """This version uses current betting pressure and public cards."""
 
-    To save time, the judge sends finished hands along with your next
-    decision request, so this always runs BEFORE choose_action() sees the
-    next hand. (The last hands of a half arrive at the end of the half.)
-
-    result has: hand_index, my_net (chips won or lost), pot,
-    went_to_showdown, board (cards revealed), opp_hole (opponent's cards,
-    only after a showdown, else None), winner ('me', 'opp' or 'split').
-    """
-    memory["hands_played"] += 1
 
 # ===== END OF YOUR CODE =====
 
