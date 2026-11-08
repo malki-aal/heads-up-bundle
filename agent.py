@@ -24,17 +24,22 @@ need to change it, and if you break it the judge can't talk to your bot.
 
 import os
 import traceback
+from time import perf_counter
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from equity import EquityModel
+from equity import EXACT_RIVER, EquityModel
 from evaluator import warmup
-from game import Action, AgentConfig, HandResult, Observation, Street
+from game import Action, AgentConfig, HandResult, Observation, Street, default_action
+from postflop import choose_planned, finish_planning, frequent_flop_bettor, protect_turn_call
+from preflop import PreflopModel
 from river_betting import choose_opening, finish_opening, record_opening
-from strategy import preflop_equity, river_response_equity, rules_equity, select_action
-from turn_policy import TurnValueModel
+from river_calibration import RiverCalibration
+from strategy import opponent_range_scale, preflop_equity, river_response_equity, rules_equity, select_action
+from turn_policy import TURN_WEIGHTS_PATH, TurnValueModel
+from sampling import prepare_scores, river_combinations, river_pair_offsets
 
 # Build omaha_score's lookup table now, while the server starts, instead of
 # during your first decision (where it would eat into your time bank).
@@ -52,65 +57,128 @@ AGENT_NAME = "EquityNet" if BOT_MODE == "ml" else "EquityRules"
 # ===== YOUR CODE HERE =====
 
 MODEL = EquityModel() if BOT_MODE == "ml" else None
+BALANCED = MODEL is not None and os.environ.get('HEADS_UP_BALANCED', '1') == '1'
+STARTING = PreflopModel() if BALANCED else None
+STARTING_POLICY = BALANCED and os.environ.get('HEADS_UP_PREFLOP', '1') == '1'
+PLANNING = BALANCED and os.environ.get('HEADS_UP_PLANNING', '1') == '1'
+if PLANNING or (MODEL is not None and EXACT_RIVER):
+    prepare_scores()
+if MODEL is not None and EXACT_RIVER:
+    river_combinations()
+    river_pair_offsets()
 TURN_MODEL = (
-    TurnValueModel()
-    if MODEL is not None and os.environ.get("HEADS_UP_TURN_MODEL") == "1"
+    TurnValueModel(os.environ.get('HEADS_UP_TURN_WEIGHTS', TURN_WEIGHTS_PATH))
+    if MODEL is not None and os.environ.get("HEADS_UP_TURN_MODEL", "1") == "1"
     else None
 )
-TURN_MARGIN = 0.12
+TURN_MARGIN = float(os.environ.get('HEADS_UP_TURN_MARGIN', '0.12'))
+FLOP_MODEL = (
+    TurnValueModel(os.environ.get('HEADS_UP_FLOP_WEIGHTS', os.path.join(os.path.dirname(__file__), 'flop_value_weights.npz')))
+    if MODEL is not None and os.environ.get('HEADS_UP_FLOP_MODEL', '0') == '1'
+    else None
+)
+FLOP_MARGIN = float(os.environ.get('HEADS_UP_FLOP_MARGIN', '0.12'))
 RIVER_BETTING = MODEL is not None and os.environ.get("HEADS_UP_RIVER_BETS", "1") == "1"
-RIVER_BET_MARGIN = 0.15
+RIVER_BET_MARGIN = float(os.environ.get('HEADS_UP_RIVER_MARGIN', '0.15'))
+LATE_GUARD = os.environ.get('HEADS_UP_LATE_GUARD', '1') == '1'
+SPREAD_PLANNING = os.environ.get('HEADS_UP_SPREAD_PLANNING', '0') == '1'
+RIVER_CALIBRATION = (
+    RiverCalibration(os.environ.get('HEADS_UP_RIVER_CALIBRATION_WEIGHTS'))
+    if MODEL is not None and os.environ.get('HEADS_UP_RIVER_CALIBRATION', '1') == '1'
+    else None
+)
+
+
+def planning_allowed(obs: Observation, memory: dict) -> bool:
+    config = memory.get('config', AgentConfig())
+    budget = config.time_bank_seconds
+    if not SPREAD_PLANNING:
+        return memory.get('thinking_time', 0.0) < 0.35 * budget
+    progress = min(1.0, (obs.hand_index + 100) / max(1, config.num_hands))
+    return (memory.get('planning_time', 0.0) < 0.35 * budget * progress
+            and memory.get('thinking_time', 0.0) < 0.70 * budget)
+
+
+def run_planning(function, obs, memory, fallback):
+    started = perf_counter()
+    try:
+        return function(obs, memory, STARTING, fallback)
+    finally:
+        memory['planning_time'] = memory.get('planning_time', 0.0) + perf_counter() - started
 
 
 def new_half(config: AgentConfig, memory: dict) -> None:
     memory.clear()
+    memory['config'] = config
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
-    # Guide 4.5: never let a bug become a judge error (5 errors = forfeit).
-    # CHECK_CALL is always legal, so it is the safe fallback.
+    started = perf_counter()
     try:
+        if RAISE_GUARD:
+            observe_turn_raise_response(obs, memory)
         action = _choose_action(obs, memory)
+        if RAISE_GUARD and obs.street == Street.TURN and action in (Action.RAISE_HALF, Action.RAISE_POT):
+            memory['turn_raise_pending'] = obs.hand_index
+        if action not in obs.legal_actions:
+            raise ValueError('Policy selected an illegal action')
+        if RIVER_BETTING and obs.street == Street.RIVER:
+            record_opening(obs, action, memory)
+        if PLANNING:
+            memory['planning_pending'] = obs, action
+        return action
     except Exception:
         memory["fallbacks"] = memory.get("fallbacks", 0) + 1
-        return Action.CHECK_CALL
-    if action not in obs.legal_actions:
-        return Action.CHECK_CALL
-    if RIVER_BETTING and obs.street == Street.RIVER:
-        record_opening(obs, action, memory)
-    return action
+        memory.pop('planning_pending', None)
+        return default_action(obs.to_call)
+    finally:
+        memory['thinking_time'] = memory.get('thinking_time', 0.0) + perf_counter() - started
 
 
 def _choose_action(obs: Observation, memory: dict, *, use_turn_model: bool = True) -> Action:
     if MODEL is not None:
-        record_flop_opener(obs, memory)
+        record_opponent_openers(obs, memory)
         seen = memory.get("flop_openers", 0)
         bets = memory.get("flop_open_bets", 0)
-        # A bet conveys little information from a player who almost always opens.
-        frequent_bettor = seen >= 16 and bets / seen >= 0.9
-        if obs.street == Street.RIVER and obs.to_call > 0 and not frequent_bettor:
-            return select_action(obs, river_response_equity(obs))
+        if obs.street == Street.RIVER and obs.to_call > 0:
+            equity = river_response_equity(obs, opponent_range_scale(memory))
+            if RIVER_CALIBRATION is not None:
+                equity = RIVER_CALIBRATION.estimate(obs, memory, equity)
+            return select_action(obs, equity)
 
     # The estimate is constant across repeat decisions on the same board.
     key = (obs.hand_index, tuple(obs.hole_cards), tuple(obs.board))
     if memory.get("equity_key") != key:
         _, hole, board = key
         if not board:
-            estimate = preflop_equity(hole)
+            estimate = STARTING.estimate(hole) if STARTING_POLICY else preflop_equity(hole)
         elif MODEL is None:
             estimate = rules_equity(hole, board)
         else:
             estimate = MODEL.estimate(hole, board)
         memory.update(equity_key=key, equity=estimate)
 
+    if not obs.board and STARTING_POLICY:
+        half, pot = STARTING.raise_thresholds
+        return select_action(obs, memory['equity'], preflop_half=half, preflop_pot=pot)
+
     if MODEL is not None and obs.street in (Street.FLOP, Street.TURN):
         # Chosen offline by net chips across duplicate matches and several styles.
         raise_margin = -0.10 if obs.street == Street.FLOP else -0.08
         equity = memory["equity"]
         fallback = select_action(obs, equity, raise_margin=raise_margin, call_margin=0.10)
+        if FLOP_MODEL is not None and obs.street == Street.FLOP and obs.to_call > 0:
+            opener_rate = (bets + 2) / (seen + 5)
+            return FLOP_MODEL.choose_action(obs, equity, opener_rate, fallback, FLOP_MARGIN)
         if use_turn_model and TURN_MODEL is not None and obs.street == Street.TURN and obs.to_call > 0:
             opener_rate = (bets + 2) / (seen + 5)
-            return TURN_MODEL.choose_action(obs, equity, opener_rate, fallback, TURN_MARGIN)
+            chosen = TURN_MODEL.choose_action(obs, equity, opener_rate, fallback, TURN_MARGIN)
+            return turn_raise_guard(obs, memory, fallback, chosen)
+        plan_here = obs.to_call == 0 or frequent_flop_bettor(obs, memory)
+        if PLANNING and plan_here and planning_allowed(obs, memory):
+            return run_planning(choose_planned, obs, memory, fallback)
+        if PLANNING and LATE_GUARD and planning_allowed(obs, memory):
+            return run_planning(protect_turn_call, obs, memory, fallback)
         return fallback
 
     fallback = select_action(obs, memory["equity"])
@@ -119,22 +187,65 @@ def _choose_action(obs: Observation, memory: dict, *, use_turn_model: bool = Tru
     return fallback
 
 
-def record_flop_opener(obs: Observation, memory: dict) -> None:
-    if obs.street != Street.FLOP or not obs.is_button:
+def record_opponent_openers(obs: Observation, memory: dict) -> None:
+    # In position, both a check and a bet from the opponent are observable.
+    # Replay the public history so a later decision also captures earlier streets.
+    if not obs.is_button:
         return
-    if memory.get("last_flop_opener") == obs.hand_index:
-        return
-    # In position, we see both checks and bets from the player acting first.
-    opener = next((event for event in obs.action_history if event.street == Street.FLOP), None)
-    if opener is None or opener.is_me:
-        return
-    memory["last_flop_opener"] = obs.hand_index
-    memory["flop_openers"] = memory.get("flop_openers", 0) + 1
-    if opener.action in (Action.RAISE_HALF, Action.RAISE_POT):
-        memory["flop_open_bets"] = memory.get("flop_open_bets", 0) + 1
+    for street in (Street.FLOP, Street.TURN, Street.RIVER):
+        counts = memory.setdefault("opponent_openers", {}).setdefault(street, {})
+        if counts.get("last_hand") == obs.hand_index:
+            continue
+        opener = next((event for event in obs.action_history if event.street == street), None)
+        if opener is None or opener.is_me:
+            continue
+        counts["last_hand"] = obs.hand_index
+        counts["seen"] = counts.get("seen", 0) + 1
+        raised = opener.action in (Action.RAISE_HALF, Action.RAISE_POT)
+        counts["bets"] = counts.get("bets", 0) + int(raised)
+        if street == Street.FLOP:
+            # Preserve the counters used by the optional turn model and trainer.
+            memory["last_flop_opener"] = obs.hand_index
+            memory["flop_openers"] = counts["seen"]
+            memory["flop_open_bets"] = counts["bets"]
+
+
+# On by default (HEADS_UP_RAISE_GUARD=0 disables): block turn-model raises that the base rule would not make
+# once this opponent has shown, within the half, that it rarely folds to our turn raises.
+RAISE_GUARD = MODEL is not None and os.environ.get('HEADS_UP_RAISE_GUARD', '1') == '1'
+RAISE_GUARD_PRIOR = 0.4      # prior fold rate to our turn raises
+RAISE_GUARD_WEIGHT = 6.0     # prior strength in observations
+RAISE_GUARD_MIN_FOLD = 0.33  # about break-even fold rate for a half-pot raise
+
+
+def _record_turn_raise(memory: dict, folded: bool) -> None:
+    memory['turn_raises_seen'] = memory.get('turn_raises_seen', 0) + 1
+    memory['turn_raise_folds'] = memory.get('turn_raise_folds', 0) + int(folded)
+    memory.pop('turn_raise_pending', None)
+
+
+def observe_turn_raise_response(obs: Observation, memory: dict) -> None:
+    """A later decision in the same hand means the opponent did not fold to our turn raise."""
+    if memory.get('turn_raise_pending') == obs.hand_index and (
+            obs.street > Street.TURN or obs.to_call > 0):
+        _record_turn_raise(memory, folded=False)
+
+
+def turn_raise_guard(obs: Observation, memory: dict, fallback: Action, chosen: Action) -> Action:
+    if not RAISE_GUARD or chosen == fallback or chosen not in (Action.RAISE_HALF, Action.RAISE_POT):
+        return chosen
+    seen, folds = memory.get('turn_raises_seen', 0), memory.get('turn_raise_folds', 0)
+    rate = (folds + RAISE_GUARD_WEIGHT * RAISE_GUARD_PRIOR) / (seen + RAISE_GUARD_WEIGHT)
+    return fallback if rate < RAISE_GUARD_MIN_FOLD else chosen
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
+    if RAISE_GUARD and memory.get('turn_raise_pending') == result.hand_index:
+        # Hand ended on the turn without showdown and we won: the opponent folded.
+        _record_turn_raise(memory, folded=(not result.went_to_showdown and result.winner == 'me'
+                                           and len(result.board) == 4))
+    if PLANNING:
+        finish_planning(result, memory)
     if RIVER_BETTING:
         finish_opening(result, memory)
 

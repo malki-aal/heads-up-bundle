@@ -4,6 +4,7 @@ from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
 from typing import Sequence
+import os
 
 import numpy as np
 
@@ -13,6 +14,7 @@ WEIGHTS_PATH = Path(__file__).with_name("equity_weights.npz")
 DECK = tuple(range(36))
 CARD_MASKS = tuple(1 << card for card in DECK)
 RIVER_SAMPLES = 768
+EXACT_RIVER = os.environ.get('HEADS_UP_EXACT_RIVER', '1') == '1'
 HOLE_PAIR_LEFT, HOLE_PAIR_RIGHT = zip(*combinations(range(5), 2))
 STRAIGHTS = tuple(frozenset(range(start, start + 5)) for start in range(5)) + (
     frozenset((8, 0, 1, 2, 3)),
@@ -62,11 +64,20 @@ def river_range_equity(
     hole: tuple[int, ...], board: tuple[int, ...], value_weight: float, value_power: float,
 ) -> float:
     """Estimate showdown equity against a mix of broad and value-heavy hands."""
-    shares, strength = river_showdown_samples(hole, board)
-    weights = strength ** value_power
-    broad_equity = shares.mean()
+    shares, strength, frequency = river_distribution(hole, board)
+    weights = frequency * strength ** value_power
+    broad_equity = np.average(shares, weights=frequency)
     value_equity = np.average(shares, weights=weights)
     return float((1 - value_weight) * broad_equity + value_weight * value_equity)
+
+
+@lru_cache(maxsize=8)
+def river_distribution(hole: tuple[int, ...], board: tuple[int, ...]):
+    if EXACT_RIVER:
+        from sampling import exact_river_distribution
+        return exact_river_distribution(hole, board)
+    shares, strength = river_showdown_samples(hole, board)
+    return shares, strength, np.ones(len(shares))
 
 
 def card_counts(cards: Sequence[int]) -> tuple[list[int], list[int]]:

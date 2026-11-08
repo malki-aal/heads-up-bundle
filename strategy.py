@@ -8,7 +8,19 @@ from game import Action, Observation, Street
 CATEGORY_EQUITY = (0.13, 0.31, 0.51, 0.68, 0.78, 0.90, 0.94, 0.985, 0.995)
 
 
-def river_response_equity(obs: Observation) -> float:
+def opponent_range_scale(memory: dict) -> float:
+    """Shrink a value-heavy range when observed opening bets are indiscriminate."""
+    openers = memory.get("opponent_openers", {})
+    river = openers.get(Street.RIVER, {})
+    counts = river if river.get("seen", 0) >= 16 else openers.get(Street.FLOP, {})
+    seen = counts.get("seen", 0)
+    rate = (counts.get("bets", 0) + 1) / (seen + 2)
+    confidence = min(1.0, seen / 16)
+    selection = max(0.0, min(1.0, (0.9 - rate) / 0.3))
+    return 1 - confidence * (1 - selection)
+
+
+def river_response_equity(obs: Observation, value_scale: float = 1.0) -> float:
     """Condition river equity on price and the betting line visible so far."""
     price = min(obs.to_call, obs.my_stack)
     pot_odds = price / (obs.pot + price)
@@ -19,7 +31,8 @@ def river_response_equity(obs: Observation) -> float:
     }
     river_reraise = obs.raises_this_street >= 2
     pressure = min(1.0, pot_odds * 1.5 + 0.20 * len(prior_aggression) + 0.25 * river_reraise)
-    return river_range_equity(obs.hole_cards, obs.board, 0.55 + 0.35 * pressure, 2 + 10 * pressure)
+    value_weight = (0.55 + 0.35 * pressure) * value_scale
+    return river_range_equity(obs.hole_cards, obs.board, value_weight, 2 + 10 * pressure)
 
 
 def preflop_equity(hole: tuple[int, ...]) -> float:
@@ -55,6 +68,7 @@ def rules_equity(hole: tuple[int, ...], board: tuple[int, ...]) -> float:
 
 def select_action(
     obs: Observation, equity: float, raise_margin: float = 0.0, call_margin: float = 0.0,
+    preflop_half: float = 0.56, preflop_pot: float = 0.61,
 ) -> Action:
     """Convert showdown equity into a legal bet, call, check, or fold."""
     legal = obs.legal_actions
@@ -63,9 +77,9 @@ def select_action(
     all_in_call = obs.opp_stack == 0 or price == obs.my_stack
 
     if not obs.board:
-        if equity >= 0.61 + raise_margin and Action.RAISE_POT in legal:
+        if equity >= preflop_pot + raise_margin and Action.RAISE_POT in legal:
             return Action.RAISE_POT
-        if equity >= 0.56 + raise_margin and obs.raises_this_street == 0 and Action.RAISE_HALF in legal:
+        if equity >= preflop_half + raise_margin and obs.raises_this_street == 0 and Action.RAISE_HALF in legal:
             return Action.RAISE_HALF
     else:
         # Require extra strength to re-raise into a range that has already bet.
@@ -78,9 +92,11 @@ def select_action(
     if Action.FOLD in legal:
         # Pot odds give the break-even equity if calling ends the betting.
         # With more betting to come, allow for incomplete equity realization.
-        cushion = 0.0 if all_in_call or len(obs.board) == 5 else 0.04
-        if obs.raises_this_street >= 2:
-            cushion += 0.04
-        if equity < pot_odds + cushion + call_margin:
+        cushion = 0.0
+        if not all_in_call and len(obs.board) < 5:
+            cushion = 0.04 + call_margin
+            if obs.raises_this_street >= 2:
+                cushion += 0.04
+        if equity < pot_odds + cushion:
             return Action.FOLD
     return Action.CHECK_CALL

@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from equity import river_showdown_samples
+from equity import river_distribution
 from game import Action, HandResult, Observation, Street
 
 BET_SIZES = (Action.RAISE_HALF, Action.RAISE_POT)
@@ -37,7 +37,7 @@ def _record_response(memory: dict, bucket: int, response: str) -> None:
 
 def opening_values(obs: Observation, memory: dict) -> dict[Action, float]:
     """Value legal check, half-pot and pot bets in chips from this decision."""
-    shares, strength = river_showdown_samples(obs.hole_cards, obs.board)
+    shares, strength, frequency = river_distribution(obs.hole_cards, obs.board)
     prior_actions = [
         event for event in obs.action_history
         if not event.is_me and event.street in (Street.FLOP, Street.TURN)
@@ -45,8 +45,8 @@ def opening_values(obs: Observation, memory: dict) -> dict[Action, float]:
     aggression = sum(event.action in BET_SIZES for event in prior_actions)
     paid_calls = sum(event.action == Action.CHECK_CALL and event.amount > 0 for event in prior_actions)
     value_mix = min(0.72, 0.13 + 0.14 * aggression + 0.10 * paid_calls)
-    strong = strength ** 3
-    weights = (1 - value_mix) / len(strength) + value_mix * strong / strong.sum()
+    strong = frequency * strength ** 3
+    weights = (1 - value_mix) * frequency / frequency.sum() + value_mix * strong / strong.sum()
 
     # Compute percentiles in the range that reached this river. Keep ties together.
     _, groups = np.unique(strength, return_inverse=True)

@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent
-BASELINES = ("random", "calling_station", "always_pot")
+BASELINES = ("random", "calling_station", "always_pot", "always_half")
 
 
 def stop(process: subprocess.Popen) -> None:
@@ -25,14 +25,15 @@ def stop(process: subprocess.Popen) -> None:
             process.wait()
 
 
-def play(task: tuple[int, str, str, str], deals: int) -> dict:
+def play(task: tuple[int, str, str, str], deals: int, reference: Path | None = None,
+         candidate_env: dict | None = None) -> dict:
     index, left, right, seed = task
     ports = (15300 + 2 * index, 15301 + 2 * index)
     base_env = {**os.environ, "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
     tokens = (token_urlsafe(24), token_urlsafe(24))
     judge_env = {**base_env, "AGENT1_TOKEN": tokens[0], "AGENT2_TOKEN": tokens[1]}
 
-    with tempfile.TemporaryDirectory() as workdir:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as workdir:
         tmp = Path(workdir)
         paths = [tmp / "half1.json", tmp / "half2.json"]
         for half, output in enumerate(paths, start=1):
@@ -40,10 +41,15 @@ def play(task: tuple[int, str, str, str], deals: int) -> dict:
             with ExitStack() as stack:
                 for port, mode, token in zip(ports, (left, right), tokens):
                     env = {**base_env, "PORT": str(port), "HEADS_UP_MODE": mode, "AGENT_TOKEN": token}
-                    script = "agent.py" if mode in ("ml", "rules") else f"baseline-bots/baseline_{mode}.py"
+                    bot_root = reference if mode == "reference" else ROOT
+                    if mode == "reference":
+                        env["HEADS_UP_MODE"] = "ml"
+                    elif mode == 'ml' and candidate_env:
+                        env.update(candidate_env)
+                    script = "agent.py" if mode in ("ml", "rules", "reference") else f"baseline-bots/baseline_{mode}.py"
                     log = stack.enter_context((tmp / f"{half}-{port}.log").open("w"))
                     process = subprocess.Popen(
-                        [sys.executable, script], cwd=ROOT, env=env,
+                        [sys.executable, script], cwd=bot_root, env=env,
                         stdout=log, stderr=subprocess.STDOUT,
                     )
                     stack.callback(stop, process)
@@ -66,7 +72,7 @@ def play(task: tuple[int, str, str, str], deals: int) -> dict:
             cwd=ROOT, env=base_env, capture_output=True, check=True, timeout=15,
         )
         result = json.loads(combined.read_text())
-    return {"left": left, "right": right, **result}
+    return {"left": left, "right": right, 'candidate_env': candidate_env or {}, **result}
 
 
 def main() -> None:
@@ -75,13 +81,25 @@ def main() -> None:
     parser.add_argument("--deals", type=int, default=1000)
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--output", type=Path, default=Path("benchmark_results.json"))
+    parser.add_argument("--reference", type=Path, help="unchanged checkout to compare before and after")
+    parser.add_argument('--candidate-env', action='append', default=[], help='candidate-only HEADS_UP_NAME=value flag')
     args = parser.parse_args()
-    pairings = [("ml", "rules"), *((mode, bot) for bot in BASELINES for mode in ("ml", "rules"))]
+    comparison = "reference" if args.reference else "rules"
+    reference = args.reference.resolve() if args.reference else None
+    if reference and not (reference / "agent.py").is_file():
+        parser.error("--reference must contain the original agent.py")
+    candidate_env = {}
+    for setting in args.candidate_env:
+        key, separator, value = setting.partition('=')
+        if not separator or not key.startswith('HEADS_UP_'):
+            parser.error('--candidate-env requires HEADS_UP_NAME=value')
+        candidate_env[key] = value
+    pairings = [("ml", comparison), *((mode, bot) for bot in BASELINES for mode in ("ml", comparison))]
     cases = [(left, right, seed) for left, right in pairings for seed in args.seeds]
     tasks = [(i, *case) for i, case in enumerate(cases)]
     results = []
     with ThreadPoolExecutor(max_workers=args.jobs) as executor:
-        futures = [executor.submit(play, task, args.deals) for task in tasks]
+        futures = [executor.submit(play, task, args.deals, reference, candidate_env) for task in tasks]
         for future in futures:
             result = future.result()
             results.append(result)
