@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 from equity import EquityModel
 from evaluator import warmup
 from game import Action, AgentConfig, HandResult, Observation, Street
+from river_betting import choose_opening, finish_opening, record_opening
 from strategy import preflop_equity, river_response_equity, rules_equity, select_action
 from turn_policy import TurnValueModel
 
@@ -57,6 +58,8 @@ TURN_MODEL = (
     else None
 )
 TURN_MARGIN = 0.12
+RIVER_BETTING = MODEL is not None and os.environ.get("HEADS_UP_RIVER_BETS", "1") == "1"
+RIVER_BET_MARGIN = 0.15
 
 
 def new_half(config: AgentConfig, memory: dict) -> None:
@@ -71,7 +74,11 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     except Exception:
         memory["fallbacks"] = memory.get("fallbacks", 0) + 1
         return Action.CHECK_CALL
-    return action if action in obs.legal_actions else Action.CHECK_CALL
+    if action not in obs.legal_actions:
+        return Action.CHECK_CALL
+    if RIVER_BETTING and obs.street == Street.RIVER:
+        record_opening(obs, action, memory)
+    return action
 
 
 def _choose_action(obs: Observation, memory: dict, *, use_turn_model: bool = True) -> Action:
@@ -106,7 +113,10 @@ def _choose_action(obs: Observation, memory: dict, *, use_turn_model: bool = Tru
             return TURN_MODEL.choose_action(obs, equity, opener_rate, fallback, TURN_MARGIN)
         return fallback
 
-    return select_action(obs, memory["equity"])
+    fallback = select_action(obs, memory["equity"])
+    if RIVER_BETTING and obs.street == Street.RIVER and obs.to_call == 0 and obs.raise_to:
+        return choose_opening(obs, memory, fallback, RIVER_BET_MARGIN)
+    return fallback
 
 
 def record_flop_opener(obs: Observation, memory: dict) -> None:
@@ -125,7 +135,8 @@ def record_flop_opener(obs: Observation, memory: dict) -> None:
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    """This version uses current betting pressure and public cards."""
+    if RIVER_BETTING:
+        finish_opening(result, memory)
 
 
 # ===== END OF YOUR CODE =====

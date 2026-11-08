@@ -25,6 +25,7 @@ sys.path.insert(0, BUNDLE)  # so agent.py can import game.py and evaluator.py
 from evaluator import cards_from_str, omaha_score  # noqa: E402
 from game import Action, AgentConfig, Deal, Game, Street, make_deal  # noqa: E402
 from judge_engine import coerce_action  # noqa: E402  (reads answers exactly like the judge)
+from river_betting import finish_opening, opening_values, record_opening  # noqa: E402
 from turn_policy import TurnValueModel, _best, turn_context  # noqa: E402
 
 TOKEN = "test-token"
@@ -252,3 +253,40 @@ def test_turn_sampler_excludes_visible_cards_and_matches_judge_scores():
     values = TurnValueModel().action_values(features, obs.legal_actions)
     assert set(values) == set(obs.legal_actions)
     assert np.isfinite(list(values.values())).all()
+
+
+@pytest.mark.parametrize(
+    ("response", "label"),
+    [(Action.FOLD, "fold"), (Action.CHECK_CALL, "call"), (Action.RAISE_POT, "raise")],
+)
+def test_river_opening_tracks_each_public_response_once(response, label):
+    game = Game(make_deal("river-opener", 0), button_seat=0)
+    while game.street < Street.RIVER:
+        game.apply(Action.CHECK_CALL)
+    hero = game.to_act
+    memory = {}
+    record_opening(game.observation(hero), Action.RAISE_HALF, memory)
+    game.apply(Action.RAISE_HALF)
+    game.apply(response)
+    if response == Action.RAISE_POT:
+        record_opening(game.observation(hero), Action.FOLD, memory)
+        game.apply(Action.FOLD)
+    result = game.hand_result(hero)
+    finish_opening(result, memory)
+    finish_opening(result, memory)
+    assert memory == {"river_responses": {0: {label: 1}}}
+
+
+def test_river_betting_values_both_sizes_with_the_nuts():
+    deal = Deal(
+        (tuple(cards_from_str("Ah Kh 6c 7d 8s")), tuple(cards_from_str("7h 8h 9c Td Ad"))),
+        tuple(cards_from_str("Qh Jh Th 6s 7c")),
+    )
+    game = Game(deal, button_seat=1)
+    while game.street < Street.RIVER:
+        game.apply(Action.CHECK_CALL)
+    obs = game.observation(0)
+    memory = {"river_responses": {0: {"call": 40}, 1: {"call": 40}}}
+    values = opening_values(obs, memory)
+    assert set(values) == set(obs.legal_actions)
+    assert values[Action.RAISE_POT] > values[Action.RAISE_HALF] > values[Action.CHECK_CALL]

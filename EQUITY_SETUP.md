@@ -36,7 +36,16 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python train_equity.py
 ```
 
-The included weights were trained on 45,000 simulated flop, turn, and river situations with 80 rollouts each. Each rollout uses the official evaluator on two hands with the same completed board. The target counts a win as 1, a tie as 0.5, and a loss as 0. Validation uses 3,000 separate simulated situations and 240 rollouts each. The training script selects the epoch with the lowest validation error and exports the weights. The model treats unseen opponent cards as equally likely. The betting policy adjusts its decisions for pot odds and raises already made, but it does not learn opponent ranges from betting history.
+The included weights were trained on 45,000 simulated flop, turn, and river situations with 80 rollouts each. Each rollout uses the official evaluator on two hands with the same completed board. The target counts a win as 1, a tie as 0.5, and a loss as 0. Validation uses 3,000 separate simulated situations and 240 rollouts each. The training script selects the epoch with the lowest validation error and exports the weights. The neural equity model treats unseen opponent cards as equally likely. The river policy also estimates a range from the betting history.
+
+## River bet sizing
+
+EquityNet compares the chip value of checking, half-pot, and pot when it can
+open the river betting. It conditions sampled hands on earlier action and
+updates its fold, call, and raise estimates from observed responses within each
+half. It switches away from the fixed-threshold action when the predicted gain
+exceeds 15% of the current pot. Set `HEADS_UP_RIVER_BETS=0` to replay the previous
+opening policy.
 
 ## Experimental turn action values
 

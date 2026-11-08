@@ -1,5 +1,6 @@
 """Card features and CPU inference for a learned showdown equity model."""
 
+from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
 from typing import Sequence
@@ -26,10 +27,11 @@ def made_score(hole: Sequence[int], board: Sequence[int]) -> int:
     return max(table[pair | triple] for pair in pairs for triple in triples)
 
 
-def river_range_equity(
-    hole: tuple[int, ...], board: tuple[int, ...], value_weight: float, value_power: float,
-) -> float:
-    """Estimate showdown equity against a mix of broad and value-heavy hands."""
+@lru_cache(maxsize=8)
+def river_showdown_samples(
+    hole: tuple[int, ...], board: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample showdown shares and opposing hand strength using visible cards."""
     unseen = sorted(set(DECK).difference(hole, board))
     rng = np.random.default_rng((*hole, *board))
     draws = rng.random((RIVER_SAMPLES, len(unseen)))
@@ -51,6 +53,16 @@ def river_range_equity(
     upper = np.searchsorted(ordered, opponent, side="right")
     # Use the same percentile for hands with the same score.
     strength = (lower + upper) / (2 * RIVER_SAMPLES)
+    shares.flags.writeable = False
+    strength.flags.writeable = False
+    return shares, strength
+
+
+def river_range_equity(
+    hole: tuple[int, ...], board: tuple[int, ...], value_weight: float, value_power: float,
+) -> float:
+    """Estimate showdown equity against a mix of broad and value-heavy hands."""
+    shares, strength = river_showdown_samples(hole, board)
     weights = strength ** value_power
     broad_equity = shares.mean()
     value_equity = np.average(shares, weights=weights)
