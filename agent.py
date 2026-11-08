@@ -31,8 +31,9 @@ from fastapi.responses import JSONResponse
 
 from equity import EquityModel
 from evaluator import warmup
-from game import Action, AgentConfig, HandResult, Observation
-from strategy import preflop_equity, rules_equity, select_action
+from game import Action, AgentConfig, HandResult, Observation, Street
+from strategy import preflop_equity, river_response_equity, rules_equity, select_action
+from turn_policy import TurnValueModel
 
 # Build omaha_score's lookup table now, while the server starts, instead of
 # during your first decision (where it would eat into your time bank).
@@ -50,6 +51,12 @@ AGENT_NAME = "EquityNet" if BOT_MODE == "ml" else "EquityRules"
 # ===== YOUR CODE HERE =====
 
 MODEL = EquityModel() if BOT_MODE == "ml" else None
+TURN_MODEL = (
+    TurnValueModel()
+    if MODEL is not None and os.environ.get("HEADS_UP_TURN_MODEL") == "1"
+    else None
+)
+TURN_MARGIN = 0.12
 
 
 def new_half(config: AgentConfig, memory: dict) -> None:
@@ -67,7 +74,16 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     return action if action in obs.legal_actions else Action.CHECK_CALL
 
 
-def _choose_action(obs: Observation, memory: dict) -> Action:
+def _choose_action(obs: Observation, memory: dict, *, use_turn_model: bool = True) -> Action:
+    if MODEL is not None:
+        record_flop_opener(obs, memory)
+        seen = memory.get("flop_openers", 0)
+        bets = memory.get("flop_open_bets", 0)
+        # A bet conveys little information from a player who almost always opens.
+        frequent_bettor = seen >= 16 and bets / seen >= 0.9
+        if obs.street == Street.RIVER and obs.to_call > 0 and not frequent_bettor:
+            return select_action(obs, river_response_equity(obs))
+
     # The estimate is constant across repeat decisions on the same board.
     key = (obs.hand_index, tuple(obs.hole_cards), tuple(obs.board))
     if memory.get("equity_key") != key:
@@ -80,7 +96,32 @@ def _choose_action(obs: Observation, memory: dict) -> Action:
             estimate = MODEL.estimate(hole, board)
         memory.update(equity_key=key, equity=estimate)
 
+    if MODEL is not None and obs.street in (Street.FLOP, Street.TURN):
+        # Chosen offline by net chips across duplicate matches and several styles.
+        raise_margin = -0.10 if obs.street == Street.FLOP else -0.08
+        equity = memory["equity"]
+        fallback = select_action(obs, equity, raise_margin=raise_margin, call_margin=0.10)
+        if use_turn_model and TURN_MODEL is not None and obs.street == Street.TURN and obs.to_call > 0:
+            opener_rate = (bets + 2) / (seen + 5)
+            return TURN_MODEL.choose_action(obs, equity, opener_rate, fallback, TURN_MARGIN)
+        return fallback
+
     return select_action(obs, memory["equity"])
+
+
+def record_flop_opener(obs: Observation, memory: dict) -> None:
+    if obs.street != Street.FLOP or not obs.is_button:
+        return
+    if memory.get("last_flop_opener") == obs.hand_index:
+        return
+    # In position, we see both checks and bets from the player acting first.
+    opener = next((event for event in obs.action_history if event.street == Street.FLOP), None)
+    if opener is None or opener.is_me:
+        return
+    memory["last_flop_opener"] = obs.hand_index
+    memory["flop_openers"] = memory.get("flop_openers", 0) + 1
+    if opener.action in (Action.RAISE_HALF, Action.RAISE_POT):
+        memory["flop_open_bets"] = memory.get("flop_open_bets", 0) + 1
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:

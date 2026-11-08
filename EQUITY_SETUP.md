@@ -38,6 +38,19 @@ python train_equity.py
 
 The included weights were trained on 45,000 simulated flop, turn, and river situations with 80 rollouts each. Each rollout uses the official evaluator on two hands with the same completed board. The target counts a win as 1, a tie as 0.5, and a loss as 0. Validation uses 3,000 separate simulated situations and 240 rollouts each. The training script selects the epoch with the lowest validation error and exports the weights. The model treats unseen opponent cards as equally likely. The betting policy adjusts its decisions for pot odds and raises already made, but it does not learn opponent ranges from betting history.
 
+## Experimental turn action values
+
+Set `HEADS_UP_TURN_MODEL=1` to try the turn model in ML mode. In PowerShell, run
+`$env:HEADS_UP_TURN_MODEL = "1"` before starting the bot. This mode compares legal
+actions when facing a turn bet. It keeps the current action unless the model
+predicts a chip gain of more than 12% of the pot from switching. The default uses
+the existing policy.
+
+The included `turn_value_weights.npz` was trained on simulated turns by playing
+out every legal action on the same sampled hands and rivers and rewarding
+incremental chips. Runtime inference uses NumPy and visible information only.
+To retrain offline, install scikit-learn and run `python train_turn_value.py`.
+
 ## Local benchmark results
 
 The table reports the average big blinds won per duplicate deal across seeds `461` and `967`, with 1,000 duplicate deals in each match. The two versions used the same preflop and betting rules.

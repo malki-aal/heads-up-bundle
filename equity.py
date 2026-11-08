@@ -11,6 +11,8 @@ from evaluator import get_table
 WEIGHTS_PATH = Path(__file__).with_name("equity_weights.npz")
 DECK = tuple(range(36))
 CARD_MASKS = tuple(1 << card for card in DECK)
+RIVER_SAMPLES = 768
+HOLE_PAIR_LEFT, HOLE_PAIR_RIGHT = zip(*combinations(range(5), 2))
 STRAIGHTS = tuple(frozenset(range(start, start + 5)) for start in range(5)) + (
     frozenset((8, 0, 1, 2, 3)),
 )
@@ -22,6 +24,37 @@ def made_score(hole: Sequence[int], board: Sequence[int]) -> int:
     pairs = [a | b for a, b in combinations((CARD_MASKS[c] for c in hole), 2)]
     triples = [a | b | c for a, b, c in combinations((CARD_MASKS[c] for c in board), 3)]
     return max(table[pair | triple] for pair in pairs for triple in triples)
+
+
+def river_range_equity(
+    hole: tuple[int, ...], board: tuple[int, ...], value_weight: float, value_power: float,
+) -> float:
+    """Estimate showdown equity against a mix of broad and value-heavy hands."""
+    unseen = sorted(set(DECK).difference(hole, board))
+    rng = np.random.default_rng((*hole, *board))
+    draws = rng.random((RIVER_SAMPLES, len(unseen)))
+    hands = np.argpartition(draws, 4, axis=1)[:, :5]
+
+    table = get_table()
+    board_masks = [CARD_MASKS[card] for card in board]
+    triples = tuple(a | b | c for a, b, c in combinations(board_masks, 3))
+    scores = np.zeros((len(unseen), len(unseen)), dtype=np.int32)
+    for i, j in combinations(range(len(unseen)), 2):
+        pair = CARD_MASKS[unseen[i]] | CARD_MASKS[unseen[j]]
+        scores[i, j] = scores[j, i] = max(table[pair | triple] for triple in triples)
+    opponent = scores[hands[:, HOLE_PAIR_LEFT], hands[:, HOLE_PAIR_RIGHT]].max(axis=1)
+
+    hero = made_score(hole, board)
+    shares = (hero > opponent) + 0.5 * (hero == opponent)
+    ordered = np.sort(opponent)
+    lower = np.searchsorted(ordered, opponent, side="left")
+    upper = np.searchsorted(ordered, opponent, side="right")
+    # Use the same percentile for hands with the same score.
+    strength = (lower + upper) / (2 * RIVER_SAMPLES)
+    weights = strength ** value_power
+    broad_equity = shares.mean()
+    value_equity = np.average(shares, weights=weights)
+    return float((1 - value_weight) * broad_equity + value_weight * value_equity)
 
 
 def card_counts(cards: Sequence[int]) -> tuple[list[int], list[int]]:

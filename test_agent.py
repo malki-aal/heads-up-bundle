@@ -13,6 +13,7 @@ import os
 import random
 import sys
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -21,8 +22,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BUNDLE = HERE if os.path.isfile(os.path.join(HERE, "game.py")) else os.path.dirname(HERE)
 sys.path.insert(0, BUNDLE)  # so agent.py can import game.py and evaluator.py
 
-from game import Action, AgentConfig, Game, make_deal  # noqa: E402
+from evaluator import cards_from_str, omaha_score  # noqa: E402
+from game import Action, AgentConfig, Deal, Game, Street, make_deal  # noqa: E402
 from judge_engine import coerce_action  # noqa: E402  (reads answers exactly like the judge)
+from turn_policy import TurnValueModel, _best, turn_context  # noqa: E402
 
 TOKEN = "test-token"
 AUTH = {"X-Agent-Token": TOKEN}
@@ -195,3 +198,57 @@ def test_reads_port_from_environment():
 # ---------------------------------------------------------------------------
 # Add your own tests below, e.g. "with two aces preflop my bot raises".
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("hole", "other_hole", "board", "expected"),
+    [
+        ("8h 8s 6c Ad Qd", "6h 7d 8d Tc Qs", "8c 9d Js Kc Ac", Action.FOLD),
+        ("Ah Kh 6c 7d 8s", "7h 8h 9c Td Ad", "Qh Jh Th 6s 7c", Action.RAISE_POT),
+    ],
+)
+def test_equitynet_responds_to_river_pot_bet(
+    monkeypatch, hole, other_hole, board, expected,
+):
+    monkeypatch.setenv("HEADS_UP_MODE", "ml")
+    module = load_agent()
+    module.TOKEN = TOKEN
+    client = TestClient(module.app)
+    assert start_half(client).status_code == 200
+    deal = Deal(
+        (tuple(cards_from_str(hole)), tuple(cards_from_str(other_hole))),
+        tuple(cards_from_str(board)),
+    )
+    game = Game(deal, button_seat=0)
+    while game.street < Street.RIVER:
+        game.apply(Action.CHECK_CALL)
+    game.apply(Action.RAISE_POT)
+    reply = client.post(
+        "/act",
+        json={"observation": game.observation(0).to_dict(), "hand_results": []},
+        headers=AUTH,
+    )
+    assert reply.status_code == 200
+    assert coerce_action(reply.json()["action"]) == expected
+
+
+def test_turn_sampler_excludes_visible_cards_and_matches_judge_scores():
+    deal = make_deal("turn-worlds", 0)
+    game = Game(deal, button_seat=0)
+    while game.street < Street.TURN:
+        game.apply(Action.CHECK_CALL)
+    obs = game.observation(game.to_act)
+    features, worlds, weights = turn_context(obs, equity=0.5, opener_rate=0.4)
+    visible = set(obs.hole_cards + obs.board)
+    assert all(len(set(world)) == 6 and not visible.intersection(world) for world in worlds)
+    assert weights.sum() == pytest.approx(1.0)
+
+    boards = np.column_stack((np.broadcast_to(obs.board, (len(worlds), 4)), worlds[:, 5]))
+    scores = _best(worlds[:, :5], boards)
+    assert scores.tolist() == [
+        omaha_score(tuple(map(int, world[:5])), tuple(map(int, board)))
+        for world, board in zip(worlds, boards)
+    ]
+    values = TurnValueModel().action_values(features, obs.legal_actions)
+    assert set(values) == set(obs.legal_actions)
+    assert np.isfinite(list(values.values())).all()

@@ -1,11 +1,25 @@
 """Shared betting policy for the learned and rules-only versions."""
 
-from equity import card_counts, made_score
+from equity import card_counts, made_score, river_range_equity
 from evaluator import category_of, STRAIGHT
-from game import Action, Observation
+from game import Action, Observation, Street
 
 # Rough equity estimates by made hand category, before draw and board adjustments.
 CATEGORY_EQUITY = (0.13, 0.31, 0.51, 0.68, 0.78, 0.90, 0.94, 0.985, 0.995)
+
+
+def river_response_equity(obs: Observation) -> float:
+    """Condition river equity on price and the betting line visible so far."""
+    price = min(obs.to_call, obs.my_stack)
+    pot_odds = price / (obs.pot + price)
+    prior_aggression = {
+        event.street for event in obs.action_history
+        if not event.is_me and event.street in (Street.FLOP, Street.TURN)
+        and event.action in (Action.RAISE_HALF, Action.RAISE_POT)
+    }
+    river_reraise = obs.raises_this_street >= 2
+    pressure = min(1.0, pot_odds * 1.5 + 0.20 * len(prior_aggression) + 0.25 * river_reraise)
+    return river_range_equity(obs.hole_cards, obs.board, 0.55 + 0.35 * pressure, 2 + 10 * pressure)
 
 
 def preflop_equity(hole: tuple[int, ...]) -> float:
@@ -39,7 +53,9 @@ def rules_equity(hole: tuple[int, ...], board: tuple[int, ...]) -> float:
     return equity
 
 
-def select_action(obs: Observation, equity: float) -> Action:
+def select_action(
+    obs: Observation, equity: float, raise_margin: float = 0.0, call_margin: float = 0.0,
+) -> Action:
     """Convert showdown equity into a legal bet, call, check, or fold."""
     legal = obs.legal_actions
     price = min(obs.to_call, obs.my_stack)
@@ -47,13 +63,13 @@ def select_action(obs: Observation, equity: float) -> Action:
     all_in_call = obs.opp_stack == 0 or price == obs.my_stack
 
     if not obs.board:
-        if equity >= 0.61 and Action.RAISE_POT in legal:
+        if equity >= 0.61 + raise_margin and Action.RAISE_POT in legal:
             return Action.RAISE_POT
-        if equity >= 0.56 and obs.raises_this_street == 0 and Action.RAISE_HALF in legal:
+        if equity >= 0.56 + raise_margin and obs.raises_this_street == 0 and Action.RAISE_HALF in legal:
             return Action.RAISE_HALF
     else:
         # Require extra strength to re-raise into a range that has already bet.
-        pressure = 0.07 if price else 0.0
+        pressure = raise_margin + (0.07 if price else 0.0)
         if equity >= 0.84 + pressure and Action.RAISE_POT in legal:
             return Action.RAISE_POT
         if equity >= 0.68 + pressure and Action.RAISE_HALF in legal:
@@ -65,6 +81,6 @@ def select_action(obs: Observation, equity: float) -> Action:
         cushion = 0.0 if all_in_call or len(obs.board) == 5 else 0.04
         if obs.raises_this_street >= 2:
             cushion += 0.04
-        if equity < pot_odds + cushion:
+        if equity < pot_odds + cushion + call_margin:
             return Action.FOLD
     return Action.CHECK_CALL
